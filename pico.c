@@ -8,6 +8,7 @@
 #include <string.h>
 
 typedef char* string;
+typedef char** string_list;
 
 /**
  * Macro to convert a letter to its corresponding Control key code
@@ -223,6 +224,48 @@ void insert_char(char c) {
     current_line->text[++current_line->len] = '\0';
 }
 
+void read_file(string filename) {
+    FILE* f = fopen(filename, "r");
+    if (!f) {
+        fatal("read_file: fopen failed");
+    }
+    line_t* current_line = first_line;
+    int c;
+    while ((c = fgetc(f)) != EOF) {
+        if (c == '\n') {
+            line_t* new = new_line();
+            link_new_line(current_line, new);
+            current_line = new;
+        }
+        else {
+            expand_line(current_line, 1);
+            current_line->text[current_line->len++] = c;
+            current_line->text[current_line->len] = '\0';
+        }
+    }
+    fclose(f);
+    current_line = first_line; // Reset to first line
+}
+
+void save_file() {
+    FILE* f = fopen(filename, "w");
+    if (!f) {
+        fatal("save_file: fopen failed");
+    }
+    line_t* line = first_line;
+    if (line) {
+        do {
+            fwrite(line->text, 1, line->len, f);
+              // Only add newline if there's another line
+            line = line->next;
+            if (line) {
+                fputc('\n', f);
+            }
+        } while (line);
+    }
+    fclose(f);
+}
+
 void draw_rows() {
     clear_screen();
     line_t* line = first_line;
@@ -239,6 +282,9 @@ void draw_rows() {
 void process_input(int c) {
     if (c == CONTROL_KEY('q')) {
         exit(0);
+    }
+    else if (c == CONTROL_KEY('s')) {
+        save_file();
     }
     else {
         switch (c) {
@@ -277,8 +323,19 @@ void refresh_screen() {
     draw_rows();
 }
 
-int main() {
+int main(int argc, string_list argv) {
     enable_raw_mode();
+
+    if (argc < 2) {
+        printf("Usage: %s <file>\n", argv[0]);
+        exit(1);
+    }
+    else {
+        filename = argv[1];
+        if (access(filename, F_OK) == 0) {
+            read_file(filename);
+        }
+    }
 
     first_line = new_line();
     current_line = first_line;
