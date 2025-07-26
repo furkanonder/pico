@@ -523,7 +523,7 @@ int main(int argc, string_list argv) {
     enable_raw_mode();
     get_window_size();
 
-    if (argc < 2) {
+    if (argc != 2) {
         printf("Usage: ./pico <file>\n");
         exit(1);
     }
