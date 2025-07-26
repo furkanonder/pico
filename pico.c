@@ -1,3 +1,5 @@
+#define _DEFAULT_SOURCE
+
 #include <termios.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
@@ -6,6 +8,7 @@
 #include <errno.h>
 #include <ctype.h>
 #include <string.h>
+#include <signal.h>
 
 typedef char* string;
 typedef char** string_list;
@@ -20,8 +23,15 @@ typedef char** string_list;
  */
 #define CONTROL_KEY(k) (toupper(k) - 'A' + 1)
 
+// Custom arrow key codes (beyond ASCII range to avoid collisions)
+#define ARROW_UP    500     // "\x1b[A" - Up arrow sequence
+#define ARROW_DOWN  501     // "\x1b[B" - Down arrow sequence
+#define ARROW_LEFT  502     // "\x1b[D" - Left arrow sequence
+#define ARROW_RIGHT 503     // "\x1b[C" - Right arrow sequence
+
 #define ENTER       13      // \r (Carriage Return)
 #define BACKSPACE   127     // DEL (Delete)
+#define ESC         '\x1b'  // Escape character (0x1B) - starts ANSI sequences
 
 #define INITIAL_CAP 128     // Initial buffer capacity for new lines
 
@@ -42,11 +52,23 @@ string filename = NULL;        // Name of currently opened file
 
 struct termios orig_termios;   // Saved original terminal settings for restoration on exit
 
+int term_rows = 24, term_cols = 80; // Terminal dimensions (updated dynamically)
 int cursor_row = 0, cursor_col = 0; // Cursor position in FILE coordinates (0-based)
+int viewport_col = 0;               // First visible column number (horizontal scroll offset)
+int viewport_row = 0;               // First visible line number (vertical scroll offset)
+int max_viewport_col = 0;           // Maximum horizontal scroll position (term_cols - margin)
+
+volatile sig_atomic_t resize_pending = 0;  // Flag to indicate terminal resize is pending
 
 static inline void clear_screen(void) {
     // Clear the screen and move the cursor to the top-left corner
     write(STDOUT_FILENO, "\x1b[2J\x1b[H", 7);
+}
+
+static inline void move_cursor_to(int row, int col) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", row, col);
+    write(STDOUT_FILENO, buf, strlen(buf));
 }
 
 void fatal(const string s) {
@@ -91,6 +113,31 @@ void enable_raw_mode() {
     // Apply the new terminal settings
     if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1) {
         fatal("Failed to enable special input mode");
+    }
+}
+
+void get_window_size() {
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == -1 || ws.ws_col == 0) {
+        // Fallback to default dimensions if ioctl fails
+        term_rows = 24;
+        term_cols = 80;
+    }
+    else {
+        term_rows = ws.ws_row - 1;  // Reserve bottom row for status line
+        term_cols = ws.ws_col;
+    }
+    max_viewport_col = term_cols - 10;  // Leave margin for horizontal scrolling
+}
+
+void handle_sigwinch(int sig) {
+    (void)sig;  // Suppress unused parameter warning
+    resize_pending = 1;
+}
+
+void setup_signals() {
+    if (signal(SIGWINCH, handle_sigwinch) == SIG_ERR) {
+        fatal("Failed to set up SIGWINCH handler");
     }
 }
 
@@ -188,6 +235,16 @@ void insert_newline() {
     cursor_row++;
 }
 
+int get_total_lines() {
+    int total_lines = 0;
+    line_t* count_line = first_line;
+    while (count_line) {
+        total_lines++;
+        count_line = count_line->next;
+    }
+    return total_lines;
+}
+
 void delete_char() {
     // Character deletion (cursor in middle or end of line)
     if (cursor_col > 0 && current_line->len > 0) {
@@ -266,17 +323,95 @@ void save_file() {
     fclose(f);
 }
 
-void draw_rows() {
-    clear_screen();
-    line_t* line = first_line;
-    while (line != NULL) {
-        write(STDOUT_FILENO, line->text, line->len);
-        // Add newline after each line (except the last one being edited)
-        if (line->next != NULL) {
-            write(STDOUT_FILENO, "\r\n", 2);
-        }
-        line = line->next;
+void draw_status() {
+   move_cursor_to(term_rows + 1, 1);    // Move cursor to the status line (bottom row of terminal)
+   write(STDOUT_FILENO, "\033[2K", 4);  // Clear the entire status line first
+   write(STDOUT_FILENO, "\033[7m", 4);  // Reverse video (inverted colors)
+   // Prepare and write the status message
+   char status[128];
+   int len = snprintf(status, sizeof(status), "Line: %d Col: %d [%dx%d]", cursor_row + 1,
+                      cursor_col + 1, term_cols, term_rows);
+   write(STDOUT_FILENO, status, len);
+   // Fill the rest of the status line with spaces to ensure full background
+   for (int i = len; i < term_cols; i++) {
+       write(STDOUT_FILENO, " ", 1);
+   }
+   write(STDOUT_FILENO, "\033[0m", 4); // Reset formatting back to normal (disable reverse video)
+}
+
+void check_scroll() {
+    // Adjust vertical viewport to keep cursor visible
+    if (cursor_row < viewport_row) {
+        viewport_row = cursor_row;  // Scroll up
     }
+    else if (cursor_row >= viewport_row + term_rows) {
+        viewport_row = cursor_row - term_rows + 1;  // Scroll down
+    }
+    // Adjust horizontal viewport for long lines
+    if (current_line) {
+        if (cursor_col < viewport_col) {
+            viewport_col = cursor_col;  // Scroll left
+        }
+        else if (cursor_col > viewport_col + max_viewport_col) {
+            viewport_col = cursor_col - max_viewport_col;  // Scroll right
+        }
+        if (viewport_col < 0) {
+            viewport_col = 0;  // Prevent negative scrolling
+        }
+    }
+}
+
+void draw_rows() {
+    int screen_row = 0;                // Current row being rendered (0 to term_rows - 1)
+    line_t* temp_curr = first_line;    // Line iterator
+    current_line = first_line;         // Reset current_line pointer
+
+    // Skip lines above the viewport (scroll offset)
+    for (int i = 0; i < viewport_row && temp_curr; i++) {
+        temp_curr = temp_curr->next;
+    }
+    // Render visible lines within the terminal window
+    while (temp_curr && screen_row < term_rows) {
+        int line_len = temp_curr->len;
+        // Calculate horizontal clipping boundaries
+        int start = viewport_col;
+        if (start > line_len) {
+            start = line_len;  // Don't start beyond line end
+        }
+        int end = start + term_cols;
+        if (end > line_len) {
+            end = line_len;    // Don't read beyond line end
+        }
+        // Calculate and write visible portion
+        int visible_len = end - start;
+        if (visible_len > 0) {
+            write(STDOUT_FILENO, temp_curr->text + start, visible_len);
+        }
+        write(STDOUT_FILENO, "\r\n", 2);  // Move to next row
+        // Update current_line when we find the cursor's line
+        if (cursor_row == viewport_row + screen_row) {
+            current_line = temp_curr;
+        }
+        temp_curr = temp_curr->next;
+        screen_row++;
+    }
+    // Fill remaining screen rows with tildes
+    while (screen_row < term_rows) {
+        write(STDOUT_FILENO, "~\r\n", 3);
+        screen_row++;
+    }
+    // Clamp cursor position to valid file bounds
+    int total_lines = get_total_lines();
+    if (cursor_row >= total_lines) {
+        cursor_row = total_lines - 1;  // Don't go past last line
+    }
+    if (cursor_row < 0) {
+        cursor_row = 0;               // Don't go before first line
+    }
+    if (current_line && cursor_col > current_line->len) {
+        cursor_col = current_line->len;  // Don't go past line end
+    }
+
 }
 
 void process_input(int c) {
@@ -288,6 +423,36 @@ void process_input(int c) {
     }
     else {
         switch (c) {
+            case ARROW_UP:
+                if (cursor_row > 0) {
+                    cursor_row--;
+                }
+                break;
+            case ARROW_DOWN:
+                if (current_line && current_line->next) {
+                    cursor_row++;
+                }
+                break;
+            case ARROW_LEFT:
+                if (cursor_col > 0) {
+                    cursor_col--;
+                }
+                else if (cursor_row > 0) {
+                    // Wrap to end of previous line
+                    cursor_row--;
+                    cursor_col = current_line->prev->len;
+                }
+                break;
+            case ARROW_RIGHT:
+                if (current_line && cursor_col < current_line->len) {
+                    cursor_col++;
+                }
+                else if (current_line && current_line->next) {
+                    // Wrap to start of next line
+                    cursor_row++;
+                    cursor_col = 0;
+                }
+                break;
             case ENTER:
                 insert_newline();
                 break;
@@ -308,46 +473,79 @@ int read_key() {
     int bytes_read = read(STDIN_FILENO, &ch, 1);
 
     if (bytes_read == -1 && errno != EAGAIN) {
-        perror("Failed to read from stdin");
-        exit(EXIT_FAILURE);
+        fatal("Failed to read from stdin");
     }
     if (bytes_read == 0) {
         return -1;
     }
 
+    if (ch == ESC) {
+        char sequence[2];
+        if (read(STDIN_FILENO, &sequence[0], 1) != 1) {
+            return ESC;
+        }
+        if (read(STDIN_FILENO, &sequence[1], 1) != 1) {
+            return ESC;
+        }
+        if (sequence[0] == '[') {
+            switch (sequence[1]) {
+                case 'A':
+                    return ARROW_UP;
+                case 'B':
+                    return ARROW_DOWN;
+                case 'C':
+                    return ARROW_RIGHT;
+                case 'D':
+                    return ARROW_LEFT;
+            }
+        }
+        return ESC;
+    }
+
     return ch;
+
 }
 
 void refresh_screen() {
+    if (resize_pending) {
+        resize_pending = 0;
+        get_window_size();
+    }
     clear_screen();
+    check_scroll();
     draw_rows();
+    draw_status();
+    move_cursor_to(cursor_row - viewport_row + 1, cursor_col - viewport_col + 1);
 }
 
 int main(int argc, string_list argv) {
+    setup_signals();
     enable_raw_mode();
+    get_window_size();
 
     if (argc < 2) {
-        printf("Usage: %s <file>\n", argv[0]);
+        printf("Usage: ./pico <file>\n");
         exit(1);
     }
-    else {
-        filename = argv[1];
-        if (access(filename, F_OK) == 0) {
-            read_file(filename);
-        }
+    current_line = first_line = new_line();
+    filename = argv[1];
+    if (access(filename, F_OK) == 0) {
+        read_file(filename);
     }
 
-    first_line = new_line();
-    current_line = first_line;
     refresh_screen(); // Initial render
     int c;
-
     while (1) {
+        if (resize_pending) {
+            refresh_screen();
+        }
         c = read_key();
         if (c != -1) {
             process_input(c);
             refresh_screen();
         }
+        // 10 ms delay to prevent excessive CPU usage
+        usleep(10000);
     }
 
     return 0;
