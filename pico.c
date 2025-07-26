@@ -519,14 +519,15 @@ void refresh_screen() {
 }
 
 int main(int argc, string_list argv) {
-    setup_signals();
-    enable_raw_mode();
-    get_window_size();
-
     if (argc != 2) {
         printf("Usage: ./pico <file>\n");
         exit(1);
     }
+
+    setup_signals();
+    enable_raw_mode();
+    get_window_size();
+
     current_line = first_line = new_line();
     filename = argv[1];
     if (access(filename, F_OK) == 0) {
